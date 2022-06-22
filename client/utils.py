@@ -100,7 +100,7 @@ def load_raw_data_icbeb(df, sampling_rate, path):
 
 
 def load_raw_data_ptbxl(df, sampling_rate, path):
-    data = np.load(path + 'raw100.npy', allow_pickle=True)
+    #data = np.load(path + 'raw100.npy', allow_pickle=True)
     if sampling_rate == 100:
         if os.path.exists(path + 'raw100.npy'):
             data = np.load(path + 'raw100.npy', allow_pickle=True)

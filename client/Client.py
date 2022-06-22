@@ -1,3 +1,4 @@
+from re import A
 import struct
 import socket
 import pickle
@@ -19,15 +20,20 @@ import Models
 import Communication
 import Flops
 import pickle
+import warnings
+warnings.simplefilter("ignore", UserWarning)
+from torchmetrics.classification import Accuracy, F1Score, AUROC
 # Set path variables to load the PTB-XL dataset and its scaler
 cwd = os.path.dirname(os.path.abspath(__file__))
-mlb_path = os.path.join(cwd,  "PTB-XL", "ptb-xl", "output", "mlb.pkl")
-scaler_path = os.path.join(cwd,  "PTB-XL", "ptb-xl", "output", "standard_scaler.pkl/")
-ptb_path = os.path.join(cwd, "PTB-XL", "ptb-xl/")
+cwd = os.path.dirname(cwd)
+mlb_path = os.path.join(cwd, "mlb.pkl")
+scaler_path = os.path.join(cwd)
+ptb_path = os.path.join(cwd, "ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.1/")
+output_path = os.path.join(cwd, "ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.1", "output/")
 
 
 # Set parameters fron json file
-f = open('client\parameter_client.json', )
+f = open('client/parameter_client.json', )
 data = json.load(f)
 
 lr = data["learningrate"]
@@ -42,11 +48,12 @@ deactivate_train_after_num_epochs = data["deactivate_train_after_num_epochs"]
 grad_encode = data["grad_encode"]
 train_gradAE_active = data["train_gradAE_active"]
 deactivate_grad_train_after_num_epochs = data["deactivate_grad_train_after_num_epochs"]
-weights_and_biases = 0
+weights_and_biases = 1
+average_setting = 'macro'
 
 # Synchronisation with Weights&Biases
 if weights_and_biases:
-    wandb.init(project="Basis", entity="split-learning-medical")
+    wandb.init(project="TCN new Metric", entity="mfrei")
     wandb.init(config={
         "learning_rate": lr,
         "batch_size": batchsize,
@@ -166,7 +173,12 @@ def train_epoch(s, content):
     :param content:
     """
     #new_split() #new random dist between train and val
-    loss_grad_total = 0
+    loss_grad_total, train_loss = 0, 0
+
+    batches_aborted, total_train_nr, total_val_nr, total_test_nr = 0, 0, 0, 0
+    hamming_epoch, precision_epoch, recall_epoch, f1_epoch, auc_train = 0, 0, 0, 0, 0
+    acc, f1, auc = 0,0,0
+
     global epoch
     epoch += 1
     flops_counter.reset()
@@ -182,10 +194,11 @@ def train_epoch(s, content):
         if train_gradAE_active:
             train_grad_active = 1
 
-    Communication.reset_tracker() #Resets all communication trackers (MBs send/recieved...)
-    train_loss = 0
-    batches_aborted, total_train_nr, total_val_nr, total_test_nr = 0, 0, 0, 0
-    hamming_epoch, precision_epoch, recall_epoch, f1_epoch, auc_train = 0, 0, 0, 0, 0
+    Communication.reset_tracker()#Resets all communication trackers (MBs send/recieved...)
+
+    test_accuracy = Accuracy(num_classes=5, average=average_setting)
+    test_f1 = F1Score(num_classes=5, average=average_setting)
+    test_auc = AUROC(num_classes=5, average=average_setting)
 
     epoch_start_time = time.time() #Tracks the time per epoch
 
@@ -209,22 +222,17 @@ def train_epoch(s, content):
 
         optimizer.zero_grad()  # sets gradients to 0 - start for backprop later
         client_output_backprop = client(x_train) #Forwards propagation
-        client_output_train = client_output_backprop.detach().clone()
+        client_output_send = client_output_backprop.detach().clone()
 
         flops_counter.read_counter("forward") #Tracks forward propagation FLOPs
 
-        client_output_train_without_ae_send = 0
+        client_output_train_not_encoded = 0
         if autoencoder:
             if train_active: #Only relevant if the AE is trained simultainiously to the actual model
                 optimizerencode.zero_grad()
-
-            client_encoded = encode(client_output_train) #Forward propagation encoder
+                client_output_train_not_encoded = client_output_send.detach().clone()
+            client_encoded = encode(client_output_send) #Forward propagation encoder
             client_output_send = client_encoded.detach().clone()
-
-            if train_active:
-                client_output_train_without_ae_send = client_output_train.detach().clone()
-        else:
-            client_output_send = client_output_train.detach().clone()
 
         flops_counter.read_counter("encoder") #Tracks encoder FLOPs
 
@@ -233,7 +241,7 @@ def train_epoch(s, content):
         #Creates a message to the Server, containing model output and training information
         msg = {
             'client_output_train': client_output_send,
-            'client_output_train_without_ae': client_output_train_without_ae_send,
+            'client_output_train_without_ae': client_output_train_not_encoded,
             'label_train': label_train,
             'batchsize': batchsize,
             'train_active': train_active,
@@ -260,10 +268,9 @@ def train_epoch(s, content):
         #Only relevant if the Gradient AE is active and potentially trains simultainiously to the actual model
         global scaler
         scaler = msg["scaler"]
+        encoder_grad_server = 0
         if msg["grad_encode"]: 
-            if train_grad_active:
-                # print("train_active")
-                optimizer_grad_decoder.zero_grad()
+            if train_grad_active: optimizer_grad_decoder.zero_grad()
             client_grad = Variable(client_grad, requires_grad=True)
             client_grad_decode = grad_decoder(client_grad)
             if train_grad_active:
@@ -272,18 +279,15 @@ def train_epoch(s, content):
                 loss_grad_autoencoder.backward()
                 encoder_grad_server = client_grad.grad.detach().clone()#
                 optimizer_grad_decoder.step()
-            else:
-                encoder_grad_server = 0
             client_grad_decode = grad_postprocessing(client_grad_decode.detach().clone().cpu())
 
-        else:
+        else: #If the gradient is not encoded and not aborted:
             if msg["client_grad_abort"] == 0:
                 client_grad_decode = client_grad.detach().clone()
-            encoder_grad_server = 0
 
         start_time_batch_backward = time.time()
 
-        if client_grad == "abort": #If the Client Update got aborted
+        if client_grad == "abort": #If the client update got aborted
             batches_aborted += 1
         else:
             if train_active:
@@ -298,10 +302,14 @@ def train_epoch(s, content):
         total_train_nr += 1
         train_loss += msg["train_loss"]
         output_train = msg["output_train"]
-        # wandb.watch(client, log_freq=100)
+
         active_training_time_batch_client += time.time() - start_time_batch_backward
 
         #Evaluation of the current batch
+        acc +=test_accuracy(output_train.detach().clone().cpu(), label_train.detach().clone().cpu().int()).numpy()
+        f1 += test_f1(output_train.detach().clone().cpu(), label_train.detach().clone().cpu().int()).numpy()
+        auc += test_auc(output_train.detach().clone().cpu(), label_train.detach().clone().cpu().int()).numpy()
+
         output = torch.round(output_train)
         try:
             roc_auc = roc_auc_score(label_train.detach().clone().cpu(), torch.round(output).detach().clone().cpu(), average='micro')
@@ -314,14 +322,21 @@ def train_epoch(s, content):
         recall_epoch += recall_score(label_train.detach().clone().cpu(), output.detach().clone().cpu(), average='micro')
         f1_epoch += f1_score(label_train.detach().clone().cpu(), output.detach().clone().cpu(), average='micro')
 
+
+    epoch_auc = test_auc.compute()
+    epoch_accuracy = test_accuracy.compute()
+    epoch_f1 = test_f1.compute()
+
+    status_train = "auc: {:.4f}, Accuracy: {:.4f}, f1: {:.4f}".format(epoch_auc, epoch_accuracy, epoch_f1)
+    print("status_train_new: ", status_train)
     epoch_endtime = time.time() - epoch_start_time
-    epoch_evaluation(hamming_epoch, precision_epoch, recall_epoch, f1_epoch, auc_train, total_train_nr, train_loss, batches_aborted, epoch_endtime)
+    epoch_evaluation(hamming_epoch, precision_epoch, recall_epoch, f1_epoch, auc_train, total_train_nr, train_loss, batches_aborted, epoch_endtime, epoch_auc, epoch_accuracy, epoch_f1)
 
     Communication.send_msg(s, 2, client.state_dict()) #Share weights with the server
     Communication.send_msg(s, 3, 0) #Communicate that the current training epoch is finished
 
 
-def epoch_evaluation(hamming_epoch, precision_epoch, recall_epoch, f1_epoch, auc_train, total_train_nr, train_loss, batches_aborted, epoch_endtime):
+def epoch_evaluation(hamming_epoch, precision_epoch, recall_epoch, f1_epoch, auc_train, total_train_nr, train_loss, batches_aborted, epoch_endtime, epoch_auc, epoch_accuracy, epoch_f1):
     """
         Evaluation function for the current training epoch
     """
@@ -342,25 +357,24 @@ def epoch_evaluation(hamming_epoch, precision_epoch, recall_epoch, f1_epoch, auc
         recall_epoch / total_train_nr,
         f1_epoch / total_train_nr, epoch_endtime, batches_aborted / total_train_nr, train_loss / total_train_nr)
     print("status_epoch_train: ", status_epoch_train)
-    print("MegaFLOPS_forward_epoch", flops_counter.flops_forward_epoch/1000000)
-    print("MegaFLOPS_encoder_epoch", flops_counter.flops_encoder_epoch/1000000)
-    print("MegaFLOPS_backprop_epoch", flops_counter.flops_backprop_epoch/1000000)
-    print("MegaFLOPS_rest", flops_counter.flops_rest/1000000)
-    print("MegaFLOPS_send", flops_counter.flops_send/1000000)
-    print("MegaFLOPS_recieve", flops_counter.flops_recieve/1000000)
+    if count_flops:
+        print("MegaFLOPS_forward_epoch", flops_counter.flops_forward_epoch/1000000)
+        print("MegaFLOPS_encoder_epoch", flops_counter.flops_encoder_epoch/1000000)
+        print("MegaFLOPS_backprop_epoch", flops_counter.flops_backprop_epoch/1000000)
+        print("MegaFLOPS_rest", flops_counter.flops_rest/1000000)
+        print("MegaFLOPS_send", flops_counter.flops_send/1000000)
+        print("MegaFLOPS_recieve", flops_counter.flops_recieve/1000000)
 
-    if weights_and_biases:
+    if weights_and_biases & count_flops:
         wandb.log({"Batches Abortrate": batches_aborted / total_train_nr, "MegaFLOPS Client Encoder": flops_counter.flops_encoder_epoch/1000000,
-                   "MegaFLOPS Client Forward": flops_counter.flops_forward_epoch / 1000000,
-                   "MegaFLOPS Client Backprop": flops_counter.flops_backprop_epoch / 1000000, "MegaFLOPS Send": flops_counter.flops_send / 1000000,
-                   "MegaFLOPS Recieve": flops_counter.flops_recieve / 1000000},
-                  commit=False)
+           "MegaFLOPS Client Forward": flops_counter.flops_forward_epoch / 1000000,
+           "MegaFLOPS Client Backprop": flops_counter.flops_backprop_epoch / 1000000, "MegaFLOPS Send": flops_counter.flops_send / 1000000,
+           "MegaFLOPS Recieve": flops_counter.flops_recieve / 1000000},
+          commit=False)
 
-    global auc_train_log
-    auc_train_log = auc_train / total_train_nr
-    global accuracy_train_log
-    accuracy_train_log = hamming_epoch / total_train_nr
-    global batches_abort_rate_total
+    global auc_train_log, accuracy_train_log, batches_abort_rate_total
+    auc_train_log = epoch_auc
+    accuracy_train_log = epoch_accuracy
     batches_abort_rate_total.append(batches_aborted / total_train_nr)
 
 
@@ -372,17 +386,21 @@ def val_stage(s, content):
     """
     total_val_nr, val_loss_total = 0, 0
     precision_epoch, recall_epoch, f1_epoch, auc_val, accuracy_sklearn,  accuracy_custom = 0, 0, 0, 0, 0, 0
-    with torch.no_grad():
+    acc, f1, auc = 0,0,0
+    val_accuracy = Accuracy(num_classes=5, average=average_setting)
+    val_f1 = F1Score(num_classes=5, average=average_setting)
+    val_auc = AUROC(num_classes=5, average=average_setting)
+
+    with torch.no_grad(): #No training involved, thus no gradient needed
         for b_t, batch_t in enumerate(val_loader):
             x_val, label_val = batch_t
             x_val, label_val = x_val.to(device), label_val.double().to(device)
-            optimizer.zero_grad()
+            #optimizer.zero_grad()
             output_val = client(x_val, drop=False)
-            client_output_val = output_val.clone().detach().requires_grad_(True)
             if autoencoder:
-                client_output_val = encode(client_output_val)
+                output_val = encode(output_val)
 
-            msg = {'client_output_val/test': client_output_val,
+            msg = {'client_output_val/test': output_val,
                    'label_val/test': label_val,}
             Communication.send_msg(s, 1, msg)
             msg = Communication.recieve_msg(s)
@@ -390,6 +408,14 @@ def val_stage(s, content):
             val_loss_total += msg["val/test_loss"]
             total_val_nr += 1
 
+            if b_t < 5:
+                print("Label: ", label_val[b_t])
+                print("Pred.: ", torch.round(output_val_server[b_t]))
+                print("-------------------------------------------------------------------------")
+
+            acc +=val_accuracy(output_val_server.detach().clone().cpu(), label_val.detach().clone().cpu().int()).numpy()
+            f1 += val_f1(output_val_server.detach().clone().cpu(), label_val.detach().clone().cpu().int()).numpy()
+            auc += val_auc(output_val_server.detach().clone().cpu(), label_val.detach().clone().cpu().int()).numpy()
             try:
                 roc_auc = roc_auc_score(label_val.detach().clone().cpu(), torch.round(output_val_server).detach().clone().cpu(), average='micro')
                 auc_val += roc_auc
@@ -409,11 +435,15 @@ def val_stage(s, content):
             f1_epoch += f1_score(label_val.detach().clone().cpu(), output_val_server.detach().clone().cpu(),
                                  average='micro', zero_division=0)
 
+    epoch_auc, epoch_accuracy, epoch_f1 = val_auc.compute(), val_accuracy.compute(), val_f1.compute()
+    status_train = "auc: {:.4f}, Accuracy: {:.4f}, f1: {:.4f}".format(epoch_auc, epoch_accuracy, epoch_f1)
+    print("status_val_new: ", status_train)
+
     if weights_and_biases:
         wandb.log({"Loss_val": val_loss_total / total_val_nr,
-               "Accuracy_val_micro": accuracy_custom / total_val_nr,
-               "F1_val": f1_epoch / total_val_nr,
-               "AUC_val": auc_val / total_val_nr,
+               "Accuracy_val": epoch_accuracy,
+               "F1_val": epoch_f1,
+               "AUC_val": epoch_auc,
                "AUC_train": auc_train_log,
                "Accuracy_train": accuracy_train_log})
 
@@ -423,15 +453,14 @@ def val_stage(s, content):
         f1_epoch / total_val_nr, val_loss_total / total_val_nr)
     print("status_epoch_val: ", status_epoch_val)
 
-    msg = 0
-    Communication.send_msg(s, 3, msg)
+    Communication.send_msg(s, 3, 0)
 
 
 def test_stage(s, epoch):
     """
     Test cycle for one epoch, started by the server
     :param s: socket
-    :param epoch: currrent epoch
+    :param epoch: current epoch
     """
     loss_test = 0.0
     correct_test, total_test = 0, 0
@@ -444,13 +473,12 @@ def test_stage(s, epoch):
         for b_t, batch_t in enumerate(val_loader):
             x_test, label_test = batch_t
             x_test, label_test = x_test.to(device), label_test.double().to(device)
-            optimizer.zero_grad()
+            #optimizer.zero_grad()
             output_test = client(x_test, drop=False)
-            client_output_test = output_test.clone().detach().requires_grad_(True)
             if autoencoder:
-                client_output_test = encode(client_output_test)
+                output_test = encode(output_test)
 
-            msg = {'client_output_val/test': client_output_test,
+            msg = {'client_output_val/test': output_test,
                    'label_val/test': label_test,
                    }
             Communication.send_msg(s, 1, msg)
@@ -473,10 +501,12 @@ def test_stage(s, epoch):
                                          average='micro')
             f1_epoch += f1_score(label_test.detach().clone().cpu(), output_test_server.detach().clone().cpu(), average='micro')
 
+
     status_test = "test: hamming_epoch: {:.4f}, precision_epoch: {:.4f}, recall_epoch: {:.4f}, f1_epoch: {:.4f}".format(
         hamming_epoch / total_test_nr, precision_epoch / total_test_nr, recall_epoch / total_test_nr,
         f1_epoch / total_test_nr)
     print("status_test: ", status_test)
+
 
 
     global data_send_per_epoch_total, data_recieved_per_epoch_total, batches_abort_rate_total
@@ -501,11 +531,12 @@ def test_stage(s, epoch):
         total_flops_rest += flop
     total_flops_model = total_flops_backprob + total_flops_encoder + total_flops_forward
     total_flops_all = total_flops_model+total_flops_send+total_flops_recieve+total_flops_rest
-    print("total FLOPs forward: ", total_flops_forward)
-    print("total FLOPs encoder: ", total_flops_encoder)
-    print("total FLOPs backprob: ", total_flops_backprob)
-    print("total FLOPs Model: ", total_flops_model)
-    print("total FLOPs: ", total_flops_all)
+    if count_flops:
+        print("total FLOPs forward: ", total_flops_forward)
+        print("total FLOPs encoder: ", total_flops_encoder)
+        print("total FLOPs backprob: ", total_flops_backprob)
+        print("total FLOPs Model: ", total_flops_model)
+        print("total FLOPs: ", total_flops_all)
     print("Average data transfer/epoch: ", data_transfer_per_epoch / epoch / 1000000, " MB")
     print("Average dismissal rate: ", average_dismissal_rate / epoch)
 
@@ -559,16 +590,16 @@ def main():
 
     global X_train, X_val, y_val, y_train, y_test, X_test
     sampling_frequency = 100
-    datafolder = 'C:/Users/maria/PycharmProjects/Medical-MESL-Debug/Medical-Dataset/Normal/ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.1/'
+    datafolder = ptb_path
     task = 'superdiagnostic'
-    outputfolder = 'C:/Users/maria/PycharmProjects/Medical-MESL-Debug/Medical-Dataset/Normal/ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.1/output/'
+    outputfolder = output_path
 
     # Load PTB-XL data
     data, raw_labels = utils.load_dataset(datafolder, sampling_frequency)
     # Preprocess label data
     labels = utils.compute_label_aggregations(raw_labels, datafolder, task)
     # Select relevant data and convert to one-hot
-    data, labels, Y, _ = utils.select_data(data, labels, task, min_samples=0, outputfolder=outputfolder)
+    data, labels, Y, _ = utils.select_data(data, labels, task, min_samples=0, outputfolder=mlb_path)
     input_shape = data[0].shape
     print(input_shape)
 
@@ -585,7 +616,7 @@ def main():
 
     print(X_train.shape, y_train.shape, X_val.shape, y_val.shape)
 
-    standard_scaler = pickle.load(open('C:/Users/maria/PycharmProjects/PTB-XL/standard_scaler.pkl', "rb"))
+    standard_scaler = pickle.load(open(scaler_path + '/standard_scaler.pkl', "rb"))
 
     X_train = utils.apply_standardizer(X_train, standard_scaler)
     X_val = utils.apply_standardizer(X_val, standard_scaler)
@@ -618,6 +649,7 @@ def main():
     #Initialize client, optimizer, error-function, potentially encoder and grad_encoder
     global client
     client = Models.Client()
+    #client = Models.Small_TCN_5(5, 12)
     print("Start Client")
     client.double().to(device)
 
@@ -627,6 +659,7 @@ def main():
 
     global error
     error = nn.BCELoss()
+    #error = nn.BCEWithLogitsLoss()
     print("Start loss calcu")
 
     if autoencoder:
