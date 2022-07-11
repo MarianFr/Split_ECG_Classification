@@ -46,7 +46,7 @@ deactivate_train_after_num_epochs = data["deactivate_train_after_num_epochs"]
 grad_encode = data["grad_encode"]
 train_gradAE_active = data["train_gradAE_active"]
 deactivate_grad_train_after_num_epochs = data["deactivate_grad_train_after_num_epochs"]
-weights_and_biases = 1
+weights_and_biases = 0
 average_setting = 'micro'
 
 # Synchronisation with Weights&Biases
@@ -567,6 +567,9 @@ def count_flops_client():
     if model == 'CNN':
         encoder_flops_forward, params = thop.profile(encode, inputs=(torch.rand(batchsize, 192, 1000).double().to(device),))
         print("Client MegaFLOPs encoder: ", encoder_flops_forward/1000000)
+    if autoencoder:
+        client_flops_encoder, params = thop.profile(encode, inputs=(torch.rand(batchsize, 11, 1000).double().to(device),))
+        print("Client MegaFLOPs encode: ", client_flops_encoder/1000000)
 
 def load_dataset():
     global X_train, X_val, y_val, y_train, y_test, X_test
